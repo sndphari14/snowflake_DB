@@ -1,0 +1,159 @@
+--drop table DIM.DIM_FISCAL_DATE;
+create or replace table DIM.DIM_FISCAL_DATE
+cluster by (FISCALDATE)
+as
+with
+params as (
+  select date('2007-01-01') as start_date,
+         date('2057-01-01') as end_exclusive,   -- exclusive upper bound (=> through 2056-12-31)
+         1 as fiscal_start_month                 -- change to 10 for Oct-Sep, etc.
+),
+-- Generate exactly 18,263 sequential days (50 years incl. leap days) from 2007-01-01
+dates as (
+  select dateadd(day, seq4(), (select start_date from params)) as d
+  from table(generator(rowcount => 18263))
+),
+filtered as (
+  select d::date as calendar_date
+  from dates
+  where d < (select end_exclusive from params)
+),
+-- Shift months so fiscal year starts at fiscal_start_month
+fiscal_align as (
+  select
+    calendar_date,
+    dateadd(month, -((select fiscal_start_month from params) - 1), calendar_date)::date as aligned_date
+  from filtered
+),
+-- Custom week calculation with Saturday as start of week
+week_calc as (
+  select
+    calendar_date,
+    aligned_date,
+    -- Calculate days since the first Saturday of the fiscal year
+    -- First, find the first Saturday of the fiscal year
+    case 
+      when dayofweek(date_trunc('year', aligned_date)) = 7 then date_trunc('year', aligned_date) -- Year starts on Saturday
+      else dateadd(day, 7 - dayofweek(date_trunc('year', aligned_date)), date_trunc('year', aligned_date)) -- Next Saturday
+    end as first_saturday_of_year
+  from fiscal_align
+),
+-- Holiday calculations based on original SQL Server logic
+holidays as (
+  select
+    calendar_date,
+    aligned_date,
+    first_saturday_of_year,
+    year(calendar_date) as cal_year,
+    month(calendar_date) as cal_month,
+    day(calendar_date) as cal_day,
+    dayofweek(calendar_date) as dow,
+    
+    case 
+      -- New Year's Day
+      when (month(calendar_date) = 1 and day(calendar_date) = 1) then true
+      -- New Year's observed (when Jan 1 falls on Sunday=7, observed on Monday Jan 2)
+      when (month(calendar_date) = 1 and day(calendar_date) = 2 and 
+            dayofweek(date(year(calendar_date) || '-01-01')) = 7) then true
+      
+      -- Christmas Day
+      when (month(calendar_date) = 12 and day(calendar_date) = 25) then true
+      -- Christmas Eve observed (when Dec 25 falls on Sunday=7, observed on Friday Dec 24 or Monday Dec 26)
+      when (month(calendar_date) = 12 and day(calendar_date) = 24 and 
+            dayofweek(date(year(calendar_date) || '-12-25')) = 7) then true
+      when (month(calendar_date) = 12 and day(calendar_date) = 26 and 
+            dayofweek(date(year(calendar_date) || '-12-25')) = 7) then true
+      -- New Year's Eve observed (when Jan 1 falls on Saturday=6, Dec 31 is observed)
+      when (month(calendar_date) = 12 and day(calendar_date) = 31 and 
+            dayofweek(date(year(calendar_date)+1 || '-01-01')) = 6) then true
+            
+      -- Independence Day (July 4th)
+      when (month(calendar_date) = 7 and day(calendar_date) = 4) then true
+      -- July 4th observed Friday (when falls on Saturday=6)
+      when (month(calendar_date) = 7 and day(calendar_date) = 3 and 
+            dayofweek(date(year(calendar_date) || '-07-04')) = 6) then true
+      -- July 4th observed Monday (when falls on Sunday=7)
+      when (month(calendar_date) = 7 and day(calendar_date) = 5 and 
+            dayofweek(date(year(calendar_date) || '-07-04')) = 7) then true
+            
+      -- Memorial Day (Last Monday=1 in May)
+      when (month(calendar_date) = 5 and dayofweek(calendar_date) = 1 and 
+            day(calendar_date) > 24) then true
+            
+      -- Labor Day (First Monday=1 in September)
+      when (month(calendar_date) = 9 and dayofweek(calendar_date) = 1 and 
+            day(calendar_date) <= 7) then true
+            
+      -- Thanksgiving (Fourth Thursday=4 in November)
+      when (month(calendar_date) = 11 and dayofweek(calendar_date) = 4 and 
+            day(calendar_date) between 22 and 28) then true
+            
+      else false
+    end as is_holiday
+  from week_calc
+),
+base as (
+  select
+    calendar_date                                      as fiscal_date,
+    to_number(to_char(calendar_date,'YYYYMMDD'))       as fiscal_date_id,
+    year(aligned_date)                                 as fiscal_year,
+    month(aligned_date)                                as fiscal_month,
+    (year(aligned_date) * 100 + month(aligned_date))   as fiscal_month_id,
+    -- Custom week number calculation (Saturday-based)
+    case 
+      when calendar_date < first_saturday_of_year then 1
+      else floor(datediff(day, first_saturday_of_year, calendar_date) / 7) + 2
+    end as week_number_in_year,
+    to_varchar(dayname(calendar_date))                 as day_description,
+    dayofyear(calendar_date)                           as day_number_in_year,
+    day(calendar_date)                                 as day_number_in_month,
+    -- Adjust day of week: Sunday=1, Monday=2, Tuesday=3, ..., Saturday=7
+    case dayofweek(calendar_date)
+      when 0 then 1  -- Sunday = 1 (your system has Sunday as 0)
+      when 1 then 2  -- Monday = 2
+      when 2 then 3  -- Tuesday = 3
+      when 3 then 4  -- Wednesday = 4
+      when 4 then 5  -- Thursday = 5
+      when 5 then 6  -- Friday = 6
+      when 6 then 7  -- Saturday = 7
+      else dayofweek(calendar_date)  -- Fallback to show actual value
+    end as day_number_in_week,
+    -- Weekdays are Mon-Fri (1-5 in your system where Sunday=0)
+    case when dayofweek(calendar_date) between 1 and 5 then 1 else 0 end as is_weekday,
+    is_holiday
+  from holidays
+),
+working_days as (
+  select
+    *,
+    -- Working day is weekday AND not holiday (matching original SQL Server logic)
+    case when is_weekday = 1 and is_holiday = false then 1 else 0 end as is_working_day
+  from base
+),
+workdays as (
+  select
+    *,
+    case when is_working_day = 1
+         then sum(is_working_day) over (
+                partition by fiscal_year, fiscal_month
+                order by fiscal_date
+                rows unbounded preceding
+              )
+         else 0
+    end as work_day_of_month
+  from working_days
+)
+select
+  fiscal_date_id                    :: number(8,0)  as FISCALDATESK,
+  fiscal_date                       :: date         as FISCALDATE,
+  fiscal_month_id                   :: number(6,0)  as FISCALMONTHSK,
+  week_number_in_year               :: smallint     as WEEKNUMBERINYEAR,
+  (to_varchar(fiscal_year) || ' Week ' || week_number_in_year)
+                                     :: string      as WEEKDESCRIPTION,
+  day_description                   :: string       as DAYDESCRIPTION,
+  day_number_in_year                :: smallint     as DAYNUMBERINYEAR,
+  day_number_in_month               :: smallint     as DAYNUMBERINMONTH,
+  day_number_in_week                :: smallint     as DAYNUMBERINWEEK,
+  work_day_of_month                 :: smallint     as WORKDAYOFMONTH
+from workdays
+order by fiscal_date;
